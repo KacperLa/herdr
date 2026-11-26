@@ -127,6 +127,8 @@ struct RecentAgentProcessExit {
 /// pane/view state no longer owns terminal identity, cwd, labels, or agent
 /// metadata.
 pub struct TerminalState {
+    // Live identity only: never serialize it into a snapshot or use it for resume.
+    custom_agent_binding: Option<CustomAgentBinding>,
     pub id: TerminalId,
     pub cwd: PathBuf,
     pub detected_agent: Option<Agent>,
@@ -164,7 +166,132 @@ pub struct TerminalState {
     pub restore_error: Option<String>,
 }
 
+struct CustomAgentBinding {
+    process: u32,
+    source: String,
+    agent: String,
+    report: Instant,
+    session: Option<crate::agent_resume::AgentSessionRef>,
+    writable: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for CustomAgentBinding {
+    fn drop(&mut self) {
+        self.writable
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 impl TerminalState {
+    pub(crate) fn custom_prompt_token(
+        &self,
+        process: u32,
+    ) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.custom_agent_session(process)?;
+        Some(self.custom_agent_binding.as_ref()?.writable.clone())
+    }
+
+    pub(crate) fn custom_agent_owner(&self) -> Option<&HookAuthority> {
+        let authority = self.hook_authority.as_ref()?;
+        let source = &authority.source;
+        (!source.starts_with("herdr:")
+            && !source.is_empty()
+            && source.len() <= 80
+            && source
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b":._-".contains(&c))
+            && self.detected_agent.is_none()
+            && self.effective_known_agent().is_none()
+            && self.effective_agent_label() == Some(authority.agent_label.as_str()))
+        .then_some(authority)
+    }
+
+    pub(crate) fn custom_agent_session(
+        &self,
+        process: u32,
+    ) -> Option<crate::api::schema::AgentSessionInfo> {
+        let owner = self.custom_agent_owner()?;
+        let binding = self.custom_agent_binding.as_ref()?;
+        let session = binding.session.as_ref()?;
+        (binding.process == process
+            && binding.report == owner.reported_at
+            && binding.source == owner.source
+            && binding.agent == owner.agent_label)
+            .then(|| crate::api::schema::AgentSessionInfo {
+                source: binding.source.clone(),
+                agent: binding.agent.clone(),
+                kind: session.kind,
+                value: session.value.clone(),
+            })
+    }
+
+    pub(crate) fn record_custom_agent_claim(
+        &mut self,
+        process: u32,
+        source: &str,
+        agent: &str,
+        seq: u64,
+        session: Option<crate::agent_resume::AgentSessionRef>,
+    ) {
+        let Some(owner) = self.custom_agent_owner() else {
+            return;
+        };
+        if owner.source != source
+            || owner.agent_label != agent
+            || self.hook_report_sequences.get(source) != Some(&seq)
+        {
+            return;
+        }
+        let session = session.or_else(|| {
+            self.custom_agent_binding
+                .as_ref()
+                .filter(|old| old.process == process && old.source == source && old.agent == agent)
+                .and_then(|old| old.session.clone())
+        });
+        self.custom_agent_binding = Some(CustomAgentBinding {
+            process,
+            source: source.into(),
+            agent: agent.into(),
+            report: owner.reported_at,
+            session,
+            writable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        });
+    }
+
+    pub(crate) fn report_custom_agent_session(
+        &mut self,
+        process: u32,
+        source: &str,
+        agent: &str,
+        seq: u64,
+        session: crate::agent_resume::AgentSessionRef,
+    ) {
+        let Some(owner) = self.custom_agent_owner() else {
+            return;
+        };
+        if owner.source != source
+            || owner.agent_label != agent
+            || !self.custom_agent_binding.as_ref().is_some_and(|binding| {
+                binding.process == process
+                    && binding.report == owner.reported_at
+                    && binding.source == source
+                    && binding.agent == agent
+            })
+            || !self.accept_hook_report(source, Some(seq))
+        {
+            return;
+        }
+        if let Some(binding) = self.custom_agent_binding.as_mut() {
+            if binding.session.as_ref() != Some(&session) {
+                binding
+                    .writable
+                    .store(false, std::sync::atomic::Ordering::Release);
+                binding.writable = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+                binding.session = Some(session);
+            }
+        }
+    }
+
     pub fn new(id: TerminalId, cwd: PathBuf) -> Self {
         Self {
             id,
@@ -174,6 +301,7 @@ impl TerminalState {
             fallback_visible_blocker: false,
             fallback_observed_at: None,
             hook_authority: None,
+            custom_agent_binding: None,
             agent_metadata: HashMap::new(),
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             persisted_agent_session: None,
@@ -792,6 +920,11 @@ impl TerminalState {
             }
         }
         self.persisted_agent_session = None;
+        if let Some(binding) = self.custom_agent_binding.as_ref() {
+            binding
+                .writable
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
         self.hook_authority = Some(HookAuthority {
             source,
             agent_label,
@@ -1791,6 +1924,7 @@ impl TerminalState {
         self.suppress_current_full_lifecycle_hook_authority(
             FullLifecycleHookSuppressionReason::HookClear,
         );
+        self.custom_agent_binding = None;
         if let Some(authority) = self.hook_authority.take() {
             self.forget_reported_resume_of(&authority.source, &authority.agent_label);
         }
@@ -1855,6 +1989,7 @@ impl TerminalState {
             self.fallback_observed_at = None;
             self.clear_agent_name();
         }
+        self.custom_agent_binding = None;
         self.hook_authority = None;
         self.forget_reported_resume_of(source, agent_label);
         if !preserve_foreign_persisted_session {
@@ -1897,6 +2032,7 @@ impl TerminalState {
         let previous_state = self.state;
         let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
         let previous_session = self.current_session_identity_for_persistence();
+        self.custom_agent_binding = None;
         self.hook_authority = None;
         self.set_reported_resume(None);
         self.detected_agent = None;
@@ -4460,6 +4596,44 @@ mod tests {
                 .map(|hook| hook.source.as_str()),
             Some("custom:pi")
         );
+    }
+
+    #[test]
+    fn live_custom_session_is_bound_to_the_active_reporter_and_process() {
+        let mut terminal = test_terminal();
+        let source = "custom:fixture";
+        let agent = "fixture";
+        let session = |id: &str| crate::agent_resume::AgentSessionRef::id(id).unwrap();
+        terminal.report_custom_agent_session(20, source, agent, 1, session("before-claim"));
+        assert!(terminal.custom_agent_session(20).is_none());
+
+        terminal.set_hook_authority_with_session_ref(
+            source.into(),
+            agent.into(),
+            AgentState::Idle,
+            None,
+            None,
+            Some(2),
+        );
+        terminal.record_custom_agent_claim(20, source, agent, 2, Some(session("first")));
+        assert_eq!(terminal.custom_agent_session(20).unwrap().value, "first");
+        let token = terminal.custom_prompt_token(20).unwrap();
+        assert!(terminal.custom_agent_session(21).is_none());
+        assert!(terminal
+            .current_session_identity_for_persistence()
+            .is_none());
+
+        terminal.report_custom_agent_session(20, "custom:other", agent, 3, session("foreign"));
+        terminal.report_custom_agent_session(21, source, agent, 3, session("wrong-process"));
+        terminal.report_custom_agent_session(20, source, agent, 2, session("out-of-order"));
+        assert_eq!(terminal.custom_agent_session(20).unwrap().value, "first");
+        assert!(token.load(std::sync::atomic::Ordering::Acquire));
+        terminal.report_custom_agent_session(20, source, agent, 4, session("new"));
+        assert!(!token.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(terminal.custom_agent_session(20).unwrap().value, "new");
+
+        terminal.release_agent_with_mutation(source, agent, Some(5));
+        assert!(terminal.custom_agent_session(20).is_none());
     }
 
     #[test]

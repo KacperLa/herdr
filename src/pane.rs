@@ -3690,6 +3690,28 @@ impl PaneRuntime {
         }
     }
 
+    #[cfg(unix)]
+    pub(crate) fn queue_guarded_user_input_submission(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+        process: u32,
+        executable: String,
+        token: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        match &self.io {
+            PaneRuntimeIo::Actor(actor) => actor.queue_guarded_user_input_submission(
+                text,
+                enter,
+                delay,
+                Some((process, executable, token)),
+            ),
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel { .. } => Err(std::io::Error::other("no foreground PTY")),
+        }
+    }
+
     pub fn queue_user_input_submission(
         &self,
         text: Bytes,

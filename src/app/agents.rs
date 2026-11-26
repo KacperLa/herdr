@@ -439,6 +439,34 @@ pub(super) fn runtime_hosts_agent(
     live_runtime_agent(runtime) == Some(expected)
 }
 
+/// Verify a native custom executable at the head of the Unix foreground job.
+pub(super) fn custom_foreground_process(
+    runtime: &crate::terminal::TerminalRuntime,
+    label: &str,
+) -> Option<u32> {
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (runtime, label);
+        None
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        if label.is_empty()
+            || !label
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_-.".contains(&c))
+            || crate::platform::is_pane_shell_process_name(label)
+            || crate::detect::parse_agent_label(label).is_some()
+        {
+            return None;
+        }
+        let child = runtime.child_pid()?;
+        let leader = crate::detect::foreground_process_group_id(child)?;
+        (leader != child && crate::platform::foreground_leader_matches(leader, label))
+            .then_some(leader)
+    }
+}
+
 fn live_runtime_agent(runtime: &crate::terminal::TerminalRuntime) -> Option<crate::detect::Agent> {
     let job = crate::detect::foreground_job(runtime.child_pid()?)?;
     crate::detect::identify_agent_in_job(&job)

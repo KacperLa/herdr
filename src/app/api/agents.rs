@@ -175,33 +175,70 @@ impl App {
                 ),
             ));
         }
-        let Some(expected_agent) = terminal.effective_known_agent() else {
-            return Err(agent_not_ready(id, &params.target));
-        };
+        let expected_agent = terminal.effective_known_agent();
         if terminal.managed_agent_launch_pending() {
             return Err(agent_not_ready(id, &params.target));
         }
         let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
             return Err(agent_not_found(id, &params.target));
         };
-        if !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
-            return Err(encode_error(
-                id,
-                "agent_not_ready",
-                format!(
-                    "agent {} is no longer the pane foreground process",
-                    params.target
-                ),
-            ));
-        }
+        let custom_guard = if let Some(expected_agent) = expected_agent {
+            if !super::super::agents::runtime_hosts_agent(runtime, expected_agent) {
+                return Err(encode_error(
+                    id,
+                    "agent_not_ready",
+                    format!(
+                        "agent {} is no longer the pane foreground process",
+                        params.target
+                    ),
+                ));
+            }
+            None
+        } else {
+            // A self-report alone is insufficient. Require an idle foreground
+            // process, a verified live binding, and an explicit session guard.
+            let Some(owner) = terminal.custom_agent_owner() else {
+                return Err(agent_not_ready(id, &params.target));
+            };
+            if terminal.state != crate::detect::AgentState::Idle
+                || owner.state != crate::detect::AgentState::Idle
+                || params.expect_session.is_none()
+                || params.text.chars().any(char::is_control)
+            {
+                return Err(agent_not_ready(id, &params.target));
+            }
+            let Some(process) =
+                super::super::agents::custom_foreground_process(runtime, &owner.agent_label)
+                    .filter(|&process| terminal.custom_agent_session(process).is_some())
+            else {
+                return Err(agent_not_ready(id, &params.target));
+            };
+            let token = terminal
+                .custom_prompt_token(process)
+                .ok_or_else(|| agent_not_ready(id.clone(), &params.target))?;
+            Some((process, owner.agent_label.clone(), token))
+        };
         let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
             return Err(agent_not_found(id, &params.target));
         };
+        if params.expect_session.as_ref().is_some_and(|expected| {
+            agent
+                .agent_session
+                .as_ref()
+                .is_none_or(|actual| &actual.value != expected)
+        }) {
+            return Err(encode_error(
+                id,
+                "agent_session_mismatch",
+                "the active agent session no longer matches the requested session",
+            ));
+        }
         Ok(ValidatedAgentPrompt {
             id,
             ws_idx: resolved.ws_idx,
             pane_id: resolved.pane_id,
             expected_agent,
+            custom_guard,
             agent,
         })
     }
@@ -223,6 +260,7 @@ impl App {
             ws_idx,
             pane_id,
             expected_agent,
+            custom_guard,
             agent,
         } = validated;
         let Some(runtime) = self.lookup_runtime_sender(ws_idx, pane_id) else {
@@ -235,7 +273,7 @@ impl App {
             .and_then(|wait| wait.submission_deadline);
         #[cfg(not(windows))]
         let submit_deadline = None;
-        if expected_agent == crate::detect::Agent::GithubCopilot {
+        if expected_agent == Some(crate::detect::Agent::GithubCopilot) {
             // Copilot ignores synthetic Enter after focus loss until it receives focus gained.
             let focus = match crate::ghostty::encode_focus(crate::ghostty::FocusEvent::Gained) {
                 Ok(focus) => focus,
@@ -250,20 +288,38 @@ impl App {
         let (text, enter) =
             crate::app::api_helpers::encode_api_submission_parts(runtime, &params.text);
         #[cfg(windows)]
-        let text = if expected_agent == crate::detect::Agent::Codex {
+        let text = if expected_agent == Some(crate::detect::Agent::Codex) {
             let mut text = text;
             append_codex_paste_boundary(runtime, &mut text);
             text
         } else {
             text
         };
-        let completion = runtime
-            .queue_user_input_submission(
-                Bytes::from(text),
-                Bytes::from(enter),
+        #[cfg(unix)]
+        let guarded = custom_guard.map(|(process, executable, token)| {
+            runtime.queue_guarded_user_input_submission(
+                Bytes::copy_from_slice(&text),
+                Bytes::copy_from_slice(&enter),
                 AGENT_PROMPT_SUBMIT_DELAY,
-                submit_deadline,
+                process,
+                executable,
+                token,
             )
+        });
+        #[cfg(not(unix))]
+        let guarded = {
+            let _ = custom_guard;
+            None
+        };
+        let completion = guarded
+            .unwrap_or_else(|| {
+                runtime.queue_user_input_submission(
+                    Bytes::from(text),
+                    Bytes::from(enter),
+                    AGENT_PROMPT_SUBMIT_DELAY,
+                    submit_deadline,
+                )
+            })
             .map_err(|err| encode_error(id.clone(), "agent_prompt_failed", err.to_string()))?;
         Ok((id, agent, completion))
     }
@@ -430,7 +486,8 @@ struct ValidatedAgentPrompt {
     id: String,
     ws_idx: usize,
     pane_id: crate::layout::PaneId,
-    expected_agent: crate::detect::Agent,
+    expected_agent: Option<crate::detect::Agent>,
+    custom_guard: Option<(u32, String, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
     agent: crate::api::schema::AgentInfo,
 }
 
@@ -518,6 +575,7 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                expect_session: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
@@ -618,6 +676,7 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                expect_session: None,
                 target: public_pane_id,
                 text: "A != B".into(),
                 wait: None,
@@ -647,6 +706,7 @@ mod tests {
             &mut app,
             "req-raw",
             AgentPromptParams {
+                expect_session: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
@@ -662,6 +722,7 @@ mod tests {
             &mut app,
             "req-label",
             AgentPromptParams {
+                expect_session: None,
                 target: "opencode".into(),
                 text: "wrong target".into(),
                 wait: None,
@@ -690,6 +751,7 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                expect_session: None,
                 target: "reviewer".into(),
                 text: "hello".into(),
                 wait: None,
@@ -724,6 +786,7 @@ mod tests {
                 &mut app,
                 "req",
                 AgentPromptParams {
+                    expect_session: None,
                     target: target.into(),
                     text: text.into(),
                     wait: None,
@@ -757,6 +820,7 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                expect_session: None,
                 target: "reviewer".into(),
                 text: "unrelated prompt".into(),
                 wait: None,
@@ -797,6 +861,7 @@ mod tests {
             &mut app,
             "req",
             AgentPromptParams {
+                expect_session: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,
@@ -876,6 +941,7 @@ mod tests {
             &mut app,
             "req-pending",
             AgentPromptParams {
+                expect_session: None,
                 target: "reviewer".into(),
                 text: "A != B".into(),
                 wait: None,

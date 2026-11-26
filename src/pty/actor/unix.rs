@@ -77,6 +77,7 @@ enum PtyIoDataCommand {
         text: Bytes,
         enter: Bytes,
         delay: Duration,
+        foreground: Option<(u32, String, Arc<std::sync::atomic::AtomicBool>)>,
         reply: std_mpsc::Sender<std::io::Result<()>>,
     },
 }
@@ -151,6 +152,16 @@ impl PtyIoActorHandle {
         enter: Bytes,
         delay: Duration,
     ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+        self.queue_guarded_user_input_submission(text, enter, delay, None)
+    }
+
+    pub(crate) fn queue_guarded_user_input_submission(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: Duration,
+        foreground: Option<(u32, String, Arc<std::sync::atomic::AtomicBool>)>,
+    ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
         let user_writes = self
             .user_writes
             .lock()
@@ -167,6 +178,7 @@ impl PtyIoActorHandle {
                 text,
                 enter,
                 delay,
+                foreground,
                 reply: reply_tx,
             })
             .map_err(|err| match err {
@@ -468,6 +480,7 @@ struct PtyIoActorRunner {
 struct ActiveSubmission {
     enter: Bytes,
     delay: Duration,
+    foreground: Option<(u32, String, Arc<std::sync::atomic::AtomicBool>)>,
     phase: SubmissionPhase,
     reply: std_mpsc::Sender<std::io::Result<()>>,
 }
@@ -652,6 +665,7 @@ impl PtyIoActorRunner {
                 text,
                 enter,
                 delay,
+                foreground,
                 reply,
             } => {
                 if self.state == ActorState::Running {
@@ -664,6 +678,7 @@ impl PtyIoActorRunner {
                     self.active_submission = Some(ActiveSubmission {
                         enter,
                         delay,
+                        foreground,
                         phase,
                         reply,
                     });
@@ -937,6 +952,25 @@ impl PtyIoActorRunner {
 
     fn flush_pending_writes_once(&mut self) -> std::io::Result<Option<SubmissionBoundary>> {
         while let Some(write) = self.pending_writes.front() {
+            if write.boundary.is_some()
+                && self
+                    .active_submission
+                    .as_ref()
+                    .and_then(|s| s.foreground.as_ref())
+                    .is_some_and(|(expected, executable, token)| {
+                        !token.load(std::sync::atomic::Ordering::Acquire)
+                            || u32::try_from(unsafe { libc::tcgetpgrp(self.file.as_raw_fd()) }).ok()
+                                != Some(*expected)
+                            || !crate::platform::foreground_leader_matches(*expected, executable)
+                    })
+            {
+                self.pending_writes.pop_front();
+                self.current_write_offset = 0;
+                self.fail_active_submission(std::io::Error::other(
+                    "custom agent session or foreground ownership changed before input was written",
+                ));
+                continue;
+            }
             let chunk = &write.bytes[self.current_write_offset..];
             match self.file.as_ref().write(chunk) {
                 Ok(0) => {

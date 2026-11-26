@@ -1568,6 +1568,43 @@ impl App {
         let report_is_newer = self
             .pane_terminal(ws_idx, pane_id)
             .is_some_and(|terminal| terminal.hook_report_is_newer(&params.source, params.seq));
+        // A different source must not replace the live custom pane owner.
+        if let Some(terminal) = self.pane_terminal(ws_idx, pane_id) {
+            if let Some(owner) = terminal.custom_agent_owner() {
+                if (owner.source != params.source || owner.agent_label != agent_label)
+                    && self
+                        .lookup_runtime_sender(ws_idx, pane_id)
+                        .and_then(|runtime| {
+                            super::super::agents::custom_foreground_process(
+                                runtime,
+                                &owner.agent_label,
+                            )
+                        })
+                        .and_then(|process| terminal.custom_agent_session(process))
+                        .is_some()
+                {
+                    return encode_error(
+                        id,
+                        "agent_owner_mismatch",
+                        "the current custom agent holds the pane",
+                    );
+                }
+            }
+        }
+        let custom_claim = if report_is_newer && !params.source.starts_with("herdr:") {
+            params.seq.zip(
+                self.lookup_runtime_sender(ws_idx, pane_id)
+                    .and_then(|runtime| {
+                        super::super::agents::custom_foreground_process(runtime, &agent_label)
+                    }),
+            )
+        } else {
+            None
+        };
+        let custom_session = params
+            .agent_session_id
+            .as_ref()
+            .and_then(|value| crate::agent_resume::AgentSessionRef::id(value.clone()));
         let session_ref = crate::agent_resume::session_ref_from_report(
             &params.source,
             &agent_label,
@@ -1583,6 +1620,17 @@ impl App {
             message: params.message,
             seq: params.seq,
         });
+        if let Some((seq, process)) = custom_claim {
+            if let Some(terminal) = self.pane_terminal_mut(ws_idx, pane_id) {
+                terminal.record_custom_agent_claim(
+                    process,
+                    &params.source,
+                    &agent_label,
+                    seq,
+                    custom_session,
+                );
+            }
+        }
         let applied =
             report_is_newer && self.session_report_applied(ws_idx, pane_id, session_ref.as_ref());
         self.report_agent_resume(
@@ -1613,6 +1661,33 @@ impl App {
         let report_is_newer = self
             .pane_terminal(ws_idx, pane_id)
             .is_some_and(|terminal| terminal.hook_report_is_newer(&params.source, params.seq));
+        if report_is_newer && !params.source.starts_with("herdr:") {
+            let custom = params
+                .seq
+                .zip(
+                    params
+                        .agent_session_id
+                        .as_ref()
+                        .and_then(|value| crate::agent_resume::AgentSessionRef::id(value.clone())),
+                )
+                .zip(
+                    self.lookup_runtime_sender(ws_idx, pane_id)
+                        .and_then(|runtime| {
+                            super::super::agents::custom_foreground_process(runtime, &agent_label)
+                        }),
+                );
+            if let Some(((seq, session), process)) = custom {
+                if let Some(terminal) = self.pane_terminal_mut(ws_idx, pane_id) {
+                    terminal.report_custom_agent_session(
+                        process,
+                        &params.source,
+                        &agent_label,
+                        seq,
+                        session,
+                    );
+                }
+            }
+        }
         let session_ref = crate::agent_resume::session_ref_from_report(
             &params.source,
             &agent_label,
@@ -1654,6 +1729,15 @@ impl App {
             self.pane_terminal(ws_idx, pane_id)
                 .is_some_and(|terminal| terminal.session_ref_is_current(session_ref))
         })
+    }
+
+    fn pane_terminal_mut(
+        &mut self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<&mut crate::terminal::TerminalState> {
+        let pane = self.state.workspaces.get(ws_idx)?.pane_state(pane_id)?;
+        self.state.terminals.get_mut(&pane.attached_terminal_id)
     }
 
     fn pane_terminal(

@@ -482,6 +482,20 @@ impl TerminalRuntime {
         self.0.validate_input_submission(bytes)
     }
 
+    #[cfg(unix)]
+    pub(crate) fn queue_guarded_user_input_submission(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+        process: u32,
+        executable: String,
+        token: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        self.0
+            .queue_guarded_user_input_submission(text, enter, delay, process, executable, token)
+    }
+
     pub fn queue_user_input_submission(
         &self,
         text: Bytes,

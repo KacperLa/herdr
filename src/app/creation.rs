@@ -359,7 +359,13 @@ impl App {
             agent_status: pane_agent_status(terminal.state, pane.seen),
             state_labels: presentation.state_labels,
             tokens: terminal.metadata_tokens.values(),
-            agent_session: terminal_agent_session_info(terminal),
+            agent_session: terminal_agent_session_info(terminal).or_else(|| {
+                let owner = terminal.custom_agent_owner()?;
+                let runtime = self.lookup_runtime_sender(ws_idx, pane_id)?;
+                let process =
+                    super::agents::custom_foreground_process(runtime, &owner.agent_label)?;
+                terminal.custom_agent_session(process)
+            }),
             scroll: None,
             revision: terminal.revision,
         })

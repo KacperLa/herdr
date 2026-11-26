@@ -1230,6 +1230,13 @@
       "$defs": {
         "AgentPromptParams": {
           "properties": {
+            "expect_session": {
+              "description": "Require the pane to still be bound to this exact session at submission.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "target": {
               "type": "string"
             },

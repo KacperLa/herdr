@@ -203,6 +203,10 @@ cli_params! {
         pub text: String => Field::new(String::new()).input(bindings::text_position("text", "TEXT", 1).verbatim()),
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub wait: Option<AgentPromptWaitOptions> => Field::new(None).input(bindings::wait_presence()),
+        /// Require the pane to still be bound to this exact session at submission.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expect_session: Option<String> => Field::new(None).input(bindings::optional_text("expect-session", "ID")),
+
     }
 }
 

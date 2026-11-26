@@ -151,6 +151,22 @@ pub struct ForegroundJob {
     pub processes: Vec<ForegroundProcess>,
 }
 
+/// A custom prompt targets a named native executable, not a shell or a string
+/// appearing somewhere in an argument list. Check again at each PTY write.
+#[cfg(unix)]
+pub(crate) fn foreground_leader_matches(pid: u32, executable: &str) -> bool {
+    foreground_group_leader_job(pid).is_some_and(|job| {
+        job.processes.iter().any(|p| {
+            p.pid == pid
+                && p.name == executable
+                && p.argv0
+                    .as_deref()
+                    .or_else(|| p.argv.as_ref()?.first().map(String::as_str))
+                    .is_some_and(|name| name.rsplit('/').next() == Some(executable))
+        })
+    })
+}
+
 /// A request from outside the process to stop the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ServerQuitSignal {
